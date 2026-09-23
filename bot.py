@@ -15,16 +15,19 @@ from __future__ import annotations
 import asyncio
 import errno
 import html
+import ipaddress
 import logging
 import math
+import mimetypes
 import os
 import re
 import shutil
 import string
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
@@ -121,6 +124,92 @@ def looks_like_mod_page(url: str) -> bool:
     return host in ("nexusmods.com", "www.nexusmods.com")
 
 
+def fmt_eta(seconds: float | None) -> str:
+    if seconds is None:
+        return "نامشخص"
+    s = int(max(seconds, 0))
+    d, rem = divmod(s, 86400)
+    h, rem = divmod(rem, 3600)
+    m, sec = divmod(rem, 60)
+    if d:
+        return f"{d} روز و {h} ساعت"
+    if h:
+        return f"{h} ساعت و {m} دقیقه"
+    if m:
+        return f"{m} دقیقه و {sec} ثانیه"
+    return f"{sec} ثانیه"
+
+
+class Stats:
+    """Speed + remaining-time bookkeeping for one job."""
+
+    def __init__(self, window: float = 30.0):
+        self.window = window  # seconds used for the moving-average download speed
+        self.samples: deque[tuple[float, int]] = deque()
+        self.dl_speed = 0.0  # last known download speed, bytes/s
+        self.up_bytes = 0  # bytes already uploaded to GitHub
+        self.up_time = 0.0  # seconds spent uploading
+
+    @property
+    def up_speed(self) -> float:
+        return self.up_bytes / self.up_time if self.up_time > 0 else 0.0
+
+    def start_part(self) -> None:
+        self.samples.clear()
+        self.samples.append((time.monotonic(), 0))
+
+    def add(self, part_bytes: int) -> None:
+        now = time.monotonic()
+        self.samples.append((now, part_bytes))
+        while len(self.samples) > 2 and now - self.samples[0][0] > self.window:
+            self.samples.popleft()
+        (t0, b0), (t1, b1) = self.samples[0], self.samples[-1]
+        if t1 - t0 >= 1:
+            self.dl_speed = (b1 - b0) / (t1 - t0)
+
+    def eta(self, total: int | None, pos: int) -> float | None:
+        """Seconds left: remaining download + (once measured) remaining upload."""
+        if not total or self.dl_speed <= 0:
+            return None
+        eta = max(total - pos, 0) / self.dl_speed
+        if self.up_speed > 0:
+            eta += max(total - self.up_bytes, 0) / self.up_speed
+        return eta
+
+    def eta_line(self, total: int | None, pos: int) -> str | None:
+        eta = self.eta(total, pos)
+        if eta is None:
+            return None
+        note = "" if self.up_speed > 0 else " (فقط دانلود؛ زمان آپلود بعد از پارت اول حساب می‌شه)"
+        return f"⏳ باقی‌مانده: حدود {fmt_eta(eta)}{note}"
+
+
+def normalize_url(url: str) -> str:
+    """Small fixups so common share links become direct links."""
+    u = urlparse(url)
+    host = (u.hostname or "").lower()
+    if host == "dropbox.com" or host.endswith(".dropbox.com"):
+        q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True) if k != "dl"]
+        q.append(("dl", "1"))
+        return urlunparse(u._replace(query=urlencode(q)))
+    return url
+
+
+async def ensure_public_host(url: str) -> None:
+    """Refuse localhost / private-network targets (the bot fetches user-supplied URLs)."""
+    host = urlparse(url).hostname
+    if not host:
+        raise BotError("آدرس لینک معتبر نیست.")
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None)
+    except OSError:
+        raise BotError("آدرس (دامنه‌ی) لینک پیدا نشد.") from None
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if not ip.is_global:
+            raise BotError("آدرس‌های داخلی/خصوصی مجاز نیستن.")
+
+
 async def with_retry(fn, describe: str, notify):
     """Run `await fn()`; retry retryable errors with exponential backoff."""
     attempt = 0
@@ -190,6 +279,7 @@ class Source:
         self.pos = 0  # bytes of the *whole file* consumed so far
         self.total: int | None = None
         self.filename: str | None = None
+        self._skip = 0  # bytes to discard after a reconnect to a server without Range support
 
     async def connect(self) -> None:
         await with_retry(self._open, "اتصال به لینک دانلود", self.notify)
@@ -211,6 +301,15 @@ class Source:
             resp.close()
             raise
         self.resp = resp
+        self._skip = 0
+        if self.pos and resp.status == 200:
+            # The server ignored our Range header: read again from the start and
+            # throw away the bytes we already have (slower, but still works).
+            self._skip = self.pos
+            await self.notify(
+                "⚠️ این سرور از ادامه‌ی دانلود (Range) پشتیبانی نمی‌کنه.\n"
+                f"⏭ از اول می‌خونم و {fmt_size(self.pos)} اول رو رد می‌کنم (ممکنه طول بکشه)..."
+            )
         if self.filename is None:
             self._learn(resp)
 
@@ -227,11 +326,6 @@ class Source:
             raise Transient(f"HTTP {s}")
         if s not in (200, 206):
             raise BotError(f"پاسخ غیرمنتظره از سرور (HTTP {s}).")
-        if self.pos and s != 206:
-            raise BotError(
-                "سرور از ادامه‌ی دانلود (Range) پشتیبانی نمی‌کنه، "
-                "برای همین نمی‌شه بعد از قطعی از همون نقطه ادامه داد."
-            )
         if "text/html" in resp.headers.get("Content-Type", "").lower():
             raise BotError(
                 "این لینک یک صفحه‌ی وب هست نه خودِ فایل. "
@@ -251,7 +345,13 @@ class Source:
             name = cd.filename
         if not name:
             name = unquote(Path(urlparse(self.url).path).name)
-        self.filename = safe_name(name)
+        name = safe_name(name)
+        if not Path(name).suffix:  # e.g. https://site/download?id=5 -> guess from Content-Type
+            ctype = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            ext = mimetypes.guess_extension(ctype) if ctype else None
+            if ext:
+                name += ext
+        self.filename = name
 
     async def read_part(self, path: Path, size: int, on_progress) -> int:
         """Download up to `size` bytes (fewer at EOF) into `path`; returns bytes written.
@@ -266,6 +366,15 @@ class Source:
                 try:
                     if self.resp is None:
                         await self._open()
+                    if self._skip:
+                        chunk = await self.resp.content.read(min(1 << 20, self._skip))
+                        if not chunk:
+                            raise Transient("connection closed while skipping")
+                        before = self.pos - self._skip
+                        self._skip -= len(chunk)
+                        if (before + len(chunk)) // (256 << 20) != before // (256 << 20):
+                            await self.notify(f"⏭ در حال رد کردن بایت‌های قبلی: {fmt_size(before + len(chunk))} / {fmt_size(self.pos)}")
+                        continue
                     chunk = await self.resp.content.read(min(1 << 20, size - written))
                     if not chunk:  # EOF
                         if self.total is not None and self.pos < self.total:
@@ -396,12 +505,15 @@ async def run_job(bot: Bot, chat_id: int, url: str, custom_title: str | None) ->
     job_dir = WORK_DIR / f"{chat_id}-{int(time.time())}"
     job_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    stats = Stats()
     uploaded: list[dict] = []
     release_url = ""
 
     try:
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=600)
         async with aiohttp.ClientSession(timeout=timeout) as session:
+            url = normalize_url(url)
+            await ensure_public_host(url)
             src = Source(session, url, notify)
             gh = GitHub(session, notify)
 
@@ -443,17 +555,23 @@ async def run_job(bot: Bot, chat_id: int, url: str, custom_title: str | None) ->
                 path = job_dir / name
                 part_start = src.pos
                 part_target = min(CHUNK_SIZE, total - part_start) if total else CHUNK_SIZE
-                t0 = time.monotonic()
+                stats.start_part()
 
-                async def on_progress(part_bytes: int) -> None:
+                async def on_progress(part_bytes: int, part_no=part_no, part_target=part_target) -> None:
+                    stats.add(part_bytes)
                     if not status.due():
                         return
-                    speed = part_bytes / max(time.monotonic() - t0, 1e-6)
-                    overall = f" • کل: {src.pos / total * 100:.1f}%" if total else ""
-                    await status.set(
-                        f"⬇️ پارت {part_no}{of_txt}: {fmt_size(part_bytes)} / {fmt_size(part_target)}"
-                        f"{overall}\n🚄 سرعت: {fmt_size(speed)}/s"
-                    )
+                    lines = [f"⬇️ پارت {part_no}{of_txt}: {fmt_size(part_bytes)} / {fmt_size(part_target)}"]
+                    if total:
+                        lines.append(f"📊 کل: {src.pos / total * 100:.1f}% ({fmt_size(src.pos)} / {fmt_size(total)})")
+                    if stats.dl_speed > 0:
+                        lines.append(f"🚄 سرعت: {fmt_size(stats.dl_speed)}/s")
+                    else:
+                        lines.append("🚄 سرعت: در حال محاسبه...")
+                    eta_line = stats.eta_line(total, src.pos)
+                    if eta_line:
+                        lines.append(eta_line)
+                    await status.set("\n".join(lines))
 
                 written = await src.read_part(path, CHUNK_SIZE, on_progress)
                 if written == 0:
@@ -464,17 +582,24 @@ async def run_job(bot: Bot, chat_id: int, url: str, custom_title: str | None) ->
                     f"⬆️ پارت {part_no}{of_txt}: در حال آپلود به GitHub ({fmt_size(written)})...",
                     force=True,
                 )
+                t_up = time.monotonic()
                 asset = await gh.upload_asset(release, path, name, f"پارت {part_no}")
+                stats.up_time += time.monotonic() - t_up
+                stats.up_bytes += written
                 path.unlink(missing_ok=True)  # free the disk immediately
                 uploaded.append(asset)
 
                 done = f"{src.pos / total * 100:.1f}%" if total else fmt_size(src.pos)
+                more = total is None or src.pos < total
+                eta_line = stats.eta_line(total, src.pos) if more else None
                 await send(
                     bot, chat_id,
                     f"✅ <b>پارت {part_no}{of_txt}</b> آپلود شد\n"
                     f"📦 <code>{html.escape(name)}</code> ({fmt_size(written)})\n"
                     f"📊 پیشرفت کل: {done}\n"
-                    f"🔗 <a href=\"{html.escape(asset['browser_download_url'], quote=True)}\">لینک دانلود این پارت</a>",
+                    + (f"🚄 سرعت دانلود: {fmt_size(stats.dl_speed)}/s • آپلود: {fmt_size(stats.up_speed)}/s\n" if stats.dl_speed > 0 else "")
+                    + (f"{eta_line}\n" if eta_line else "")
+                    + f"🔗 <a href=\"{html.escape(asset['browser_download_url'], quote=True)}\">لینک دانلود این پارت</a>",
                 )
                 index += 1
 
@@ -541,7 +666,8 @@ HELP_TEXT = (
     "آدرس زیر اسم فایل راست‌کلیک → Copy link address. (Firefox: توی پنل Downloads راست‌کلیک → "
     "Copy Download Link.) بعدش دانلود مرورگر رو Cancel کن.\n"
     "3️⃣ همون لینک رو <b>سریع</b> اینجا بفرست (لینک‌ها زود منقضی می‌شن).\n\n"
-    "می‌تونی بعد از لینک، یک اسم دلخواه برای Release هم بنویسی.\n\n"
+    "می‌تونی بعد از لینک، یک اسم دلخواه برای Release هم بنویسی.\n"
+    "🌐 لینک مستقیم سایت‌های دیگه هم کار می‌کنه (هر لینکی که مستقیم به خودِ فایل برسه).\n\n"
     "/cancel — لغو کار در حال اجرا\n"
     "/id — نمایش آیدی عددی تو"
 )
